@@ -74,7 +74,7 @@ def main():
         nonlocal counter
         counter += 1
 
-    results["original"] = ref_mesh
+    # results["original"] = ref_mesh
 
     # max_iters = range(50, 201, 50)
     # for iters in max_iters:
@@ -209,6 +209,6 @@ def predecimated():
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     # fix_broken()
-    predecimated()
+    # predecimated()

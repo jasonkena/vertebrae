@@ -81,7 +81,9 @@ def align_mesh(ref_mesh, pred_mesh, cpd_type, target_reduction, cpd_kwargs):
     # convert (anisotropic) mesh to uniformly distributed triangles, allowing sampling of uniform points on mesh
     # downsample mesh to target number of points
     ref_mesh = normalize_mesh(ref_mesh, int((1 - target_reduction) * ref_mesh.n_points))
-    pred_mesh = normalize_mesh(pred_mesh, int((1 - target_reduction) * pred_mesh.n_points))
+    pred_mesh = normalize_mesh(
+        pred_mesh, int((1 - target_reduction) * pred_mesh.n_points)
+    )
 
     tf_param, _, _ = cpd.registration_cpd(
         ref_mesh.points,
@@ -104,9 +106,7 @@ def fix_mesh(mesh, joincomp=False, remove_smallest_components=True):
         joincomp=joincomp,
         remove_smallest_components=remove_smallest_components,
     )
-    if mesh_fix.mesh.points.shape[0] < 200:
-        print("nuked")
-        __import__('pdb').set_trace()
+    if mesh_fix.mesh.points.shape[0] == 0:
         raise ValueError("MeshFix nuked mesh")
     return mesh_fix.mesh
 
