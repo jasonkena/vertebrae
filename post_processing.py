@@ -1,18 +1,19 @@
 import os
 import glob
 import argparse
+from tqdm import tqdm
 
 import numpy as np
 import nibabel as nib
 
-from probreg import cpd, bcpd
-from tqdm import tqdm
+from probreg import cpd
 
 import pyvista as pv
 import pymeshfix as mf
+import pyacvd
 
 """
-reference was obtained from Totalsegmentator_dataset/s0224, a case which had complete vertebrae annotations
+NOTE: reference was obtained from Totalsegmentator_dataset/s0224, a case which had complete vertebrae annotations
 """
 
 ORDERING = [
@@ -44,6 +45,7 @@ ORDERING = [
 
 
 def read_reference(reference_path):
+    # from sample ground truth (Totalsegmentator), return label volume
     reference = {}
     for file in sorted(glob.glob(os.path.join(reference_path, "*"))):
         # from path .../vertebrae_L1.nii.gz to L1
@@ -58,24 +60,28 @@ def read_reference(reference_path):
 
 def align_mesh(ref_mesh, pred_mesh, cpd_type, target_reduction, cpd_kwargs):
     # takes in ref_mesh and pred_mesh, returns aligned ref_mesh
+    # target_reduction is fraction of mesh faces to delete
+
     # NOTE: modifies ref_mesh and pred_mesh in place
 
+    # normalize to unit sphere, to enable easier registration
+    # especially since anisotropy in pred_mesh causes "compression" in z-axis
     ref_mean = ref_mesh.points.mean(axis=0)
     pred_mean = pred_mesh.points.mean(axis=0)
     ref_std = ref_mesh.points.std(axis=0)
     pred_std = pred_mesh.points.std(axis=0)
 
-    # normalize to unit sphere
     ref_mesh.points = (ref_mesh.points - ref_mean) / ref_std
     pred_mesh.points = (pred_mesh.points - pred_mean) / pred_std
 
-    # decimate to reduce number of triangle vertices
-    ref_mesh = ref_mesh.decimate(target_reduction)
-    pred_mesh = pred_mesh.decimate(target_reduction)
-
-    # ensure watertightness; applying the transformation might cause overlapping triangles, and then mesh.repair() will delete all the faces, nuking the mesh
+    # ensure watertightness, no overlapping triangles, etc.
     ref_mesh = fix_mesh(ref_mesh)
     pred_mesh = fix_mesh(pred_mesh)
+
+    # convert (anisotropic) mesh to uniformly distributed triangles, allowing sampling of uniform points on mesh
+    # downsample mesh to target number of points
+    ref_mesh = normalize_mesh(ref_mesh, int((1 - target_reduction) * ref_mesh.n_points))
+    pred_mesh = normalize_mesh(pred_mesh, int((1 - target_reduction) * pred_mesh.n_points))
 
     tf_param, _, _ = cpd.registration_cpd(
         ref_mesh.points,
@@ -84,40 +90,52 @@ def align_mesh(ref_mesh, pred_mesh, cpd_type, target_reduction, cpd_kwargs):
         **cpd_kwargs,
     )
 
+    # align ref_mesh to pred_mesh, convert back to original prediction frame
     aligned_ref_pc = tf_param.transform(ref_mesh.points) * pred_std + pred_mean
-    # tf_param = bcpd.registration_bcpd(ref_mesh.points, pred_mesh.points)
-    # aligned_ref_pc = tf_param.transform(ref_mesh.points) * pred_std + pred_mean
-
     ref_mesh.points = aligned_ref_pc
 
     return ref_mesh
 
 
 def fix_mesh(mesh, joincomp=False, remove_smallest_components=True):
+    # remove small components, fill holes, remove intersecting triangles
     mesh_fix = mf.MeshFix(mesh)
     mesh_fix.repair(
         joincomp=joincomp,
         remove_smallest_components=remove_smallest_components,
-        verbose=True,
     )
     if mesh_fix.mesh.points.shape[0] < 200:
+        print("nuked")
+        __import__('pdb').set_trace()
         raise ValueError("MeshFix nuked mesh")
     return mesh_fix.mesh
 
 
-def voxel_to_mesh(vol):
+def normalize_mesh(mesh, clusters, subdivide=3):
+    # used to undo skewed (anisotropic) triangles, regularizing everything
+    # subdivide is number of times to subdivide each triangle
+    # clusters is approx number of points
+    clus = pyacvd.Clustering(mesh)
+    clus.subdivide(subdivide)
+    clus.cluster(clusters)
+
+    return clus.create_mesh()
+
+
+def voxel_to_mesh(vol, threshold=0.99):
+    # use as high threshold as possible to avoid dilating the segmentation
     # https://docs.pyvista.org/version/stable/examples/00-load/create-uniform-grid.html
     grid = pv.ImageData()
     grid.dimensions = vol.shape
     grid.point_data["values"] = vol.flatten(order="F")
 
-    # create mesh by running flying edges with isocontour value of 0.5
-    mesh = grid.contour([0.5])
+    # calculate mesh with isocontour value of threshold
+    mesh = grid.contour([threshold])
     return mesh
 
 
 def mesh_to_voxel(mesh, shape):
-    # crashes if check_surface is True, very weird
+    # crashes without check_surface=False for some reason, though no RuntimeError is raised
     grid = pv.voxelize(mesh, density=1, check_surface=False)
     # flooring should be fine, see https://github.com/pyvista/pyvista/blob/392d29ea4398c7292275300b44b75bcdbbed1c2e/pyvista/core/utilities/features.py#L78-L82
     points = np.floor(grid.points).astype(int)
@@ -143,7 +161,6 @@ def post_process(reference, prediction, cpd_type, target_reduction, cpd_kwargs):
         transformed_mesh = align_mesh(
             ref_mesh, pred_mesh, cpd_type, target_reduction, cpd_kwargs
         )
-        # transformed_mesh = fix_mesh(transformed_mesh)
 
         segmentation = mesh_to_voxel(transformed_mesh, prediction.shape)
 
@@ -199,10 +216,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_cuda", action="store_true")  # requires cupy
     # with 0.9, ~1000 points are used for matching
     parser.add_argument(
-        "--target_reduction", type=int, default=0.9
+        "--target_reduction", type=int, default=0.8
     )  # simplifying number of vertices in mesh
 
-    cpd_kwargs = {"lmd": 1e-3, "beta": 1e-3}
+    # w is probability of point being outlier
+    # lmd and beta are hyperparameters for CPD
+    cpd_kwargs = {"w": 0.1, "lmd": 2, "beta": 8}
 
     args = parser.parse_args()
 
